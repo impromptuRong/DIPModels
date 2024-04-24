@@ -2641,7 +2641,7 @@ class Slide(object):
             # tifffile don't reorder page, so need convertion here. Little bit slow.
             tiff_page_idx = self.page_indices[level] % len(self.fh.pages)
             patch = tiff_page_read_region(self.fh.pages[tiff_page_idx], x0, y0, w, h)[0]
-            if patch.shape[-1] == 1:  # single channel
+            if len(patch.shape) == 3 and patch.shape[-1] == 1:  # single channel
                 patch = patch[..., 0]
             patch = Image.fromarray(patch)
         else:
