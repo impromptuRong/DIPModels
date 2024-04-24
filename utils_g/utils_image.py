@@ -32,6 +32,7 @@ from matplotlib.patches import Circle, Wedge, Polygon, Rectangle
 from skimage.color import rgb2hsv, hsv2rgb, hed2rgb, rgb2hed, gray2rgb
 # from pycocotools import mask as mask_utils
 
+from skimage.measure._regionprops import RegionProperties
 
 # IMAGE_NET_MEAN_TF = np.array([123.68, 116.779, 103.939])
 # IMAGE_NET_STD_TF = 1.0
@@ -1384,7 +1385,7 @@ def stack_masks(img, val_to_label=None, criteria=lambda x: x.area > 1, channel_a
 
 
 ## regionprops name changed: https://scikit-image.org/docs/0.19.x/release_notes.html?highlight=regionprops
-def split_masks(img, val_to_label, mode='instance', bbox_mode='xyxy', mask_mode='mask',
+def split_masks(img, val_to_label=None, mode='instance', bbox_mode='xyxy', mask_mode='mask',
                 channel_axis=-1, criteria=lambda x: x.area > 1, filled=False, **kwargs):
     """ Transfer a mask image to masks， bboxes and labels. 
     Arguments:
@@ -1425,8 +1426,11 @@ def split_masks(img, val_to_label, mode='instance', bbox_mode='xyxy', mask_mode=
         h, w = [img.shape[_] for _ in range(img.ndim) if _ != channel_axis]
     else:
         h, w = img.shape
-    res = []
     
+    if val_to_label is None:
+        val_to_label = {val: idx for idx, val in enumerate(np.unique(img, axis=channel_axis))}
+
+    res = []
     for val, label in val_to_label.items():
         if channel_axis is not None:
             img_label = np.all(img == val, axis=channel_axis)
@@ -1615,7 +1619,7 @@ class Mask(object):
             return self.poly()
         elif mode.startswith('mask'):
             return self.mask(dtype)
-        elif model.startswith('rle'):
+        elif mode.startswith('rle'):
             return self.rle()
         else:
             raise ValueError(f"{mode} is not supported.")
@@ -1705,7 +1709,7 @@ class Mask(object):
         elif self.mode.startswith('rle'):
             return len(self.m) > 0
         elif self.mode.startswith('mask'):
-            return m.sum() > 0
+            return self.m.sum() > 0
 
 
 class Box(object):
@@ -1716,7 +1720,7 @@ class Box(object):
         self.mode = mode
 
 
-class ObjectProperties(skimage.measure._regionprops.RegionProperties):
+class ObjectProperties(RegionProperties):
     """ Simplify skimage.measure.RegionProperties. 
         Avoid the unnecessary memory cost and computational time to resize and 
         paste model predictions to original image size.
@@ -2083,7 +2087,7 @@ def overlay_detections(ax, bboxes=None, labels=None, masks=None, scores=None,
     if labels_color is None:  # give unique color to each type
         unique_labels = np.unique(labels)
         _cmap = default_color_palette(n_colors=len(unique_labels))
-        palette = {label: color for label, color in enumerate(unique_labels, _cmap)}
+        palette = {label: color for label, color in zip(unique_labels, _cmap)}
         color_array = [palette[label] for label in labels]
     elif isinstance(labels_color, str) and labels_color.startswith('object'):
         color_array = default_color_palette(n_colors=len(labels))
@@ -2275,11 +2279,13 @@ def tiff_page_read_region(page, w0, h0, w, h):
     if h < 1 or w < 1:
         raise ValueError("h and w must be strictly positive.")
 
-    if h0 < 0 or w0 < 0 or h0 + h >= im_height or w0 + w >= im_width:
-        raise ValueError("Requested crop area is out of image bounds.")
+#     if h0 < 0 or w0 < 0 or h0 + h >= im_height or w0 + w >= im_width:
+#         raise ValueError("Requested crop area is out of image bounds.")
 
     tile_width, tile_height = page.tilewidth, page.tilelength
     h1, w1 = h0 + h, w0 + w
+    h0, w0 = max(0, h0), max(0, w0)
+    h1, w1 = min(h0 + h, im_height), min(w0 + w, im_width)
 
     tile_h0, tile_w0 = h0 // tile_height, w0 // tile_width
     tile_h1, tile_w1 = np.ceil([h1 / tile_height, w1 / tile_width]).astype(int)
@@ -2306,7 +2312,7 @@ def tiff_page_read_region(page, w0, h0, w, h):
 
             fh.seek(offset)
             data = fh.read(bytecount)
-            tile, indices, shape = page.decode(data, index, jpegtables)
+            tile, indices, shape = page.decode(data, index, jpegtables=jpegtables)
 
             im_h = (i - tile_h0) * tile_height
             im_w = (j - tile_w0) * tile_width
@@ -2464,45 +2470,47 @@ class Slide(object):
         self.level_dims = []
         self.level_downsamples = []
         
-        try:
-            if verbose:
-                print(f"Loading slide: {self.img_file}")
-            with open(self.img_file, 'rb') as fp:
-                slide = TiffFile(fp)
-                self.description = slide.pages[0].description
+#         try:
+        if verbose:
+            print(f"Loading slide: {self.img_file}")
+        with open(self.img_file, 'rb') as fp:
+            slide = TiffFile(fp)
+            self.description = slide.pages[0].description
 
-                # magnification
-                val = re.findall(r'\|((?i:AppMag)|(?i:magnitude)) = (?P<mag>[\d.]+)', self.description)
-                self.magnitude = float(val[0][1]) if val else None
-                if verbose and self.magnitude is None:
-                    print(f"Didn't find magnitude in description.")
+            # magnification
+            val = re.findall(r'((?i:mag)|(?i:magnitude))(\s)*=(\s)*(?P<mag>[\d.]+)', self.description)
+            self.magnitude = float(val[0][-1]) if val else None
+            if verbose and self.magnitude is None:
+                print(f"Didn't find magnitude in description.")
 
-                # mpp
-                val = re.findall(r'\|((?i:MPP)) = (?P<mpp>[\d.]+)', self.description)
-                self.mpp = float(val[0][1]) if val else None
-                if verbose and self.mpp is None:
-                    print(f"Didn't find mpp in description.")
+            # mpp
+            val = re.findall(r'((?i:mpp))(\s)*=(\s)*(?P<mpp>[\d.]+)', self.description)
+            self.mpp = float(val[0][-1]) if val else None
+            if verbose and self.mpp is None:
+                print(f"Didn't find mpp in description.")
 
-                ## level_dims consistent with open_slide: (w, h), (OriginalHeight, OriginalWidth)
-                level_dims, scales = [(slide.pages[0].shape[1], slide.pages[0].shape[0])], [1.0]
-                for page in slide.pages[1:]:
-                    if 'label' in page.description or 'macro' in page.description:
-                        continue
-                    if page.tilewidth == 0 or page.tilelength == 0:
-                        continue
-                    h, w = page.shape[0], page.shape[1]
-                    if round(level_dims[0][0]/w) == round(level_dims[0][1]/h):
-                        level_dims.append((w, h))
-                        scales.append(level_dims[0][0]/w)
+            ## level_dims consistent with open_slide: (w, h), (OriginalHeight, OriginalWidth)
+            level_dims, scales, page_indices = [(slide.pages[0].shape[1], slide.pages[0].shape[0])], [1.0], [0]
+            for page_idx, page in enumerate(slide.pages[1:], 1):
+                if 'label' in page.description or 'macro' in page.description:
+                    continue
+                if page.tilewidth == 0 or page.tilelength == 0:
+                    continue
+                h, w = page.shape[0], page.shape[1]
+                if round(level_dims[0][0]/w) == round(level_dims[0][1]/h):
+                    level_dims.append((w, h))
+                    scales.append(level_dims[0][0]/w)
+                    page_indices.append(page_idx)
 
-                self.page_indices = sorted(range(len(scales)), key=lambda x: scales[x])
-                self.level_dims = [level_dims[idx] for idx in self.page_indices]
-                self.level_downsamples = [scales[idx] for idx in self.page_indices]
-                self.n_levels = len(self.level_downsamples)
-        except Exception as e:
-            if verbose:
-                print(f"Failed to load slide: {img_file}.")
-                print(e)
+            order = sorted(range(len(scales)), key=lambda x: scales[x])
+            self.page_indices = [page_indices[idx] for idx in order]
+            self.level_dims = [level_dims[idx] for idx in order]
+            self.level_downsamples = [scales[idx] for idx in order]
+            self.n_levels = len(self.level_downsamples)
+#         except Exception as e:
+#             if verbose:
+#                 print(f"Failed to load slide: {img_file}.")
+#                 print(e)
                 # traceback.print_exc()
         
         ## load annotations
@@ -2538,19 +2546,24 @@ class Slide(object):
         }
 
     def attach_reader(self, fh, engine='openslide'):
+        ## precalculate some args for read_region
+        if engine == 'openslide':
+            # N = len(fh.level_dimensions)
+            # dims = [_ for _ in fh.level_dimensions]
+            # self._osr_cfg = {'n_levels': N, 'level_dims': dims, 'level_downsamples': scales,}
+            levels = [fh.get_best_level_for_downsample(x + 1e-2) 
+                      for x in self.level_downsamples]
+            scales = [self.level_downsamples[lvl] / fh.level_downsamples[osr_level] 
+                      for lvl, osr_level in enumerate(levels)]
+            self._osr_map = {'levels': levels, 'scales': scales,}
+        elif engine == 'tifffile':
+            self._osr_map = {}
+        else:
+            raise ValueError(f"Engine: {engine} must be one from ['openslide', 'tifffile'].")
+        
         self.fh = fh
         self.engine = engine
         
-        ## precalculate some args for read_region
-        # N = len(fh.level_dimensions)
-        # dims = [_ for _ in fh.level_dimensions]
-        # self._osr_cfg = {'n_levels': N, 'level_dims': dims, 'level_downsamples': scales,}
-        levels = [fh.get_best_level_for_downsample(x + 1e-2) 
-                  for x in self.level_downsamples]
-        scales = [self.level_downsamples[lvl] / fh.level_downsamples[osr_level] 
-                  for lvl, osr_level in enumerate(levels)]
-        self._osr_map = {'levels': levels, 'scales': scales,}
-
         return self
     
     def detach_reader(self, close=True):
@@ -2628,6 +2641,9 @@ class Slide(object):
             # tifffile don't reorder page, so need convertion here. Little bit slow.
             tiff_page_idx = self.page_indices[level] % len(self.fh.pages)
             patch = tiff_page_read_region(self.fh.pages[tiff_page_idx], x0, y0, w, h)[0]
+            if patch.shape[-1] == 1:  # single channel
+                patch = patch[..., 0]
+            patch = Image.fromarray(patch)
         else:
             raise ValueError(f"Engine: {self.engine} is not supported for reading patch.")
         # print(f"utils_image.get_patch: {t3-t0}, {t4-t3}, {(x0, y0, w, h)}")

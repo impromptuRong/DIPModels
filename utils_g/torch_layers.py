@@ -1,4 +1,5 @@
-from collections import OrderedDict, Mapping
+from collections import OrderedDict
+from collections.abc import Mapping
 import inspect
 import itertools
 import copy

@@ -82,6 +82,7 @@ class TrainConfig(Config):
     
     ## Callbacks
     LR_SCHEDULER = ('MultiStepLR', {'milestones': [300, 800], 'gamma': 0.5})
+    WARMUP = None  # {'multiplier': 1.0, 'total_epoch': 3}
     EARLY_STOPPING = ('loss/val', {'patience': 50, 'mode': 'min'})
     REDUCE_LR_ON_PLATEAU = ('loss/val', {'mode': 'min', 'factor': 0.1, 
                             'patience': 50, 'verbose': False, 'threshold': 1e-4})
@@ -393,7 +394,11 @@ class TorchModel(object):
                 fn = getattr(torch.optim.lr_scheduler, config.LR_SCHEDULER[0])
             else:
                 fn = config.LR_SCHEDULER[0]
-            self.lr_scheduler = fn(self.optimizer, **config.LR_SCHEDULER[1])
+            lr_scheduler = fn(self.optimizer, **config.LR_SCHEDULER[1])
+            if config.WARMUP is not None:
+                lr_scheduler = GradualWarmupScheduler(
+                    self.optimizer, after_scheduler=lr_scheduler, **config.WARMUP)
+            self.lr_scheduler = lr_scheduler
         else:
             self.lr_scheduler = None
         
@@ -406,6 +411,7 @@ class TorchModel(object):
         
         self.clipnorm = config.GRADIENT_CLIPNORM or 0.
         self.clipvalue = config.GRADIENT_CLIPVALUE or 0.
+        print(f"optimizer={self.optimizer}: clipnorm={self.clipnorm}, clipvalue={self.clipvalue}")
     
     def train(self, train_loader, val_loader, epochs, config, 
               trainable_layers=".*", verbose=1, **kwargs):
@@ -451,7 +457,8 @@ class TorchModel(object):
             tf_writer = SummaryWriter(log_dir=self.log_dir)
         else:
             tf_writer = None
-            
+        
+        indicator, ckpt_epoch = float('inf'), self.epoch
         while self.epoch < epochs:
             self.epoch += 1
             logger = OrderedDict({'epoch': self.epoch})
@@ -490,6 +497,13 @@ class TorchModel(object):
             if config.EVAL_FREQUENCY and self.epoch % config.EVAL_FREQUENCY == 0:
                 ## output epoch information into log file
                 self.write_log(logger, tf_writer)
+            
+            new_indicator = logger[config.EARLY_STOPPING[0]]
+            if new_indicator < indicator - config.EARLY_STOPPING[1]['threshold']:
+                indicator, ckpt_epoch = new_indicator, self.epoch
+            else:
+                if self.epoch - ckpt_epoch > config.EARLY_STOPPING[1]['patience']:
+                    break
     
     def write_log(self, logger, writer, global_step=None):
         """ Save stats, images, etc for tensorboard.
@@ -709,7 +723,7 @@ class GradualWarmupScheduler(torch.optim.lr_scheduler._LRScheduler):
         after_scheduler: after target_epoch, use this scheduler(eg. ReduceLROnPlateau)
     """
 
-    def __init__(self, optimizer, multiplier, total_epoch, after_scheduler=None):
+    def __init__(self, optimizer, multiplier=1.0, total_epoch=3, after_scheduler=None):
         self.multiplier = multiplier
         if self.multiplier < 1.:
             raise ValueError('multiplier should be greater than or equal to 1.')
@@ -732,6 +746,19 @@ class GradualWarmupScheduler(torch.optim.lr_scheduler._LRScheduler):
         else:
             return [base_lr * ((self.multiplier - 1.) * self.last_epoch / self.total_epoch + 1.) for base_lr in self.base_lrs]
 
+    def step(self, epoch=None, metrics=None):
+        if type(self.after_scheduler) != torch.optim.lr_scheduler.ReduceLROnPlateau:
+            if self.finished and self.after_scheduler:
+                if epoch is None:
+                    self.after_scheduler.step(None)
+                else:
+                    self.after_scheduler.step(epoch - self.total_epoch)
+                self._last_lr = self.after_scheduler.get_last_lr()
+            else:
+                return super(GradualWarmupScheduler, self).step(epoch)
+        else:
+            self.step_ReduceLROnPlateau(metrics, epoch)
+
     def step_ReduceLROnPlateau(self, metrics, epoch=None):
         if epoch is None:
             epoch = self.last_epoch + 1
@@ -745,19 +772,6 @@ class GradualWarmupScheduler(torch.optim.lr_scheduler._LRScheduler):
                 self.after_scheduler.step(metrics, None)
             else:
                 self.after_scheduler.step(metrics, epoch - self.total_epoch)
-
-    def step(self, epoch=None, metrics=None):
-        if type(self.after_scheduler) != torch.optim.lr_scheduler.ReduceLROnPlateau:
-            if self.finished and self.after_scheduler:
-                if epoch is None:
-                    self.after_scheduler.step(None)
-                else:
-                    self.after_scheduler.step(epoch - self.total_epoch)
-                self._last_lr = self.after_scheduler.get_last_lr()
-            else:
-                return super(GradualWarmupScheduler, self).step(epoch)
-        else:
-            self.step_ReduceLROnPlateau(metrics, epoch)
 
 
 def warmup_lr_scheduler(optimizer, warmup_iters, warmup_factor):
