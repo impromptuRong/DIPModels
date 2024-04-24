@@ -1773,7 +1773,7 @@ def binary_mask_to_coco_annotation(x, mask_id=None, image_id=None,
     
     height, width = x.shape
     rle = mask_utils.encode(np.asfortranarray(x.astype(np.uint8)))
-    bbox = mask_utils.toBbox(rle).astype(np.int).tolist()
+    bbox = mask_utils.toBbox(rle).astype(np.int32).tolist()
     area = 1.0 * mask_utils.area(rle)
     if iscrowd:
         mask = binary_mask_to_rle(x, compress=False)
@@ -2930,7 +2930,7 @@ class Slide:
         ## shift bboxes at corner and border into valid region, flip x and y to match cv2 functions
         coords[:,0] = np.clip(coords[:,0], 0, w - patch_size[0])
         coords[:,1] = np.clip(coords[:,1], 0, h - patch_size[1])
-        patches = np.hstack([coords.astype(np.int), np.tile(patch_size, (pool_size, 1))])
+        patches = np.hstack([coords.astype(np.int32), np.tile(patch_size, (pool_size, 1))])
         
         ## generate mask and calculate iou (project on low resolution to save time)
 
@@ -2938,9 +2938,9 @@ class Slide:
             level_idx = self.get_resize_level((1024, 1024))
             masks = self.polygons2mask(polygons, shape=self.level_dims[level_idx], scale=1./scales[level_idx])
             scores = np.array([np.sum(masks[y0:y0+dh, x0:x0+dw])/dw/dh 
-                               for x0, y0, dw, dh in (patches / np.tile(scales[level_idx], 2)).astype(np.int)])
+                               for x0, y0, dw, dh in (patches / np.tile(scales[level_idx], 2)).astype(np.int32)])
         else:
-            scores = np.array([scores_fn(_) for _ in patches.astype(np.int)])
+            scores = np.array([scores_fn(_) for _ in patches.astype(np.int32)])
 
         # cv2 may cause segmentation fault...
         keep = cv2.dnn.NMSBoxes(patches, scores, score_threshold=coverage_threshold, 
