@@ -1,9 +1,10 @@
 import os
 import cv2
+import copy
 import json
 import time
+import numbers
 
-import skimage
 import tifffile
 import argparse
 import datetime
@@ -11,9 +12,9 @@ import datetime
 import numpy as np
 import pandas as pd
 from PIL import Image
-from tifffile import TiffFile
-Image.MAX_IMAGE_PIXELS = None
 
+Image.MAX_IMAGE_PIXELS = None
+from utils_image import rgba2rgb
 
 TIFF_PARAMS = {
     'tile': (1, 256, 256), 
@@ -21,14 +22,34 @@ TIFF_PARAMS = {
     # 'compress': True,
     # 'compression': 'zlib', # compression=('jpeg', 95),  # None RGBA, requires imagecodecs
     'compression': 'jpeg',
-    # 'compressionargs': 
+    'compressionargs': {'level': 95},
+    # 'compression': 'zlib',
+    # 'compressionargs': {'level': 8},
 }
 
 
-def get_page(image_file, level=0):
-    with open(image_file, 'rb') as fp:
-        fh = TiffFile(fp)
-        return fh.pages[0].asarray()
+def to_ascii(text):
+    return text.encode('ascii', 'ignore').decode('ascii')
+
+
+def get_level_images(image_file, level=None):
+    series = 0
+    with tifffile.TiffFile(image_file) as tif:
+        descp = tif.pages[0].description
+        axis_map = {name: idx for idx, name in enumerate(tif.series[series].dims)}
+        order = [axis_map['height'], axis_map['width']]
+        order += [x for x in range(len(axis_map)) if x not in order]
+
+        pages_list = tif.series[series].levels        
+        if isinstance(level, numbers.Number):
+            level = [level]
+        if level is None:
+            level = [x for x in range(len(pages_list))]
+        level = [x % len(pages_list) for x in level]
+
+        pages = [pages_list[idx].asarray().transpose(order) for idx in level]
+
+        return pages, descp
 
 
 def filter_image_file(x, exts=['.png', '.jpeg', '.jpg', '.tif', '.tiff', '.ndpi']):
@@ -51,8 +72,8 @@ def folder_iterator(folder, keep_fn=None):
             yield file_idx, rel_path, file_path
 
 
-def wsi_imwrite(image, filename, header, slide_info, tiff_params, bigtiff=False, scales=None, **kwargs):
-    w0, h0 = image.shape[1], image.shape[0]
+def get_tiff_params(image, tiff_params):
+    tiff_params = copy.deepcopy(tiff_params)
     if len(image.shape) == 2:  # single channel
         if 'photometric' not in tiff_params:
             tiff_params['photometric'] = 'MINISBLACK'
@@ -61,36 +82,57 @@ def wsi_imwrite(image, filename, header, slide_info, tiff_params, bigtiff=False,
         default_photometric = {3: 'RGB', 4: 'RGBA'}[image.shape[-1]]
         if 'photometric' not in tiff_params:
             tiff_params['photometric'] = default_photometric
+    
+    return tiff_params
 
-    tile_w, tile_h = tiff_params['tile'][-2:]   # (None/depth, w, h)
-    print(image.shape, tiff_params)
-    # mpp = slide_info.get('mpp', 0.25)
+
+def get_default_description(page, header, tiff_params, **kwargs):
+    params = get_tiff_params(page, tiff_params)
+    
+    tile_w, tile_h = params['tile'][-2:]
+    w0, h0 = page.shape[1], page.shape[0]
     now = datetime.datetime.now()
 
-    if scales is None:
-        scales = []
-        w, h, scale = w0, h0, 1
-        while w > 512 or h > 512:
-            scale *= 2
-            scales.append(scale)
-            w, h = w0 // scale, h0 // scale
-    print(scales)
+    descp = f"{header}\n{w0}x{h0} ({tile_w}x{tile_h}) {params['photometric']}|{now.strftime('Date = %Y-%m-%d|Time = %H:%M:%S')}"
+    for k, v in kwargs.items():
+        descp += f'|{k} = {v}'
 
+    return descp
+
+
+def wsi_imwrite(images, filename, description=None, scale=0.5, 
+                tiff_params=TIFF_PARAMS, bigtiff=False,):
+    if isinstance(images, list):
+        image_list = [_ for _ in images]
+    else:
+        image = images
+        image_list = [image]
+        while image.shape[1] > 512 or image.shape[0] > 512:
+            image = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
+            image_list.append(image)
+
+    image_sizes = [(x.shape[1], x.shape[0]) for x in image_list]
+    w0, h0 = image_sizes[0]
+    tile_w, tile_h = tiff_params['tile'][-2:]   # (None/depth, w, h)
     with tifffile.TiffWriter(filename, bigtiff=bigtiff) as tif:
-        info_message = ', '.join(f'{k}={v}' for k, v in slide_info.items())
-        descp = f"{header}\n{w0}x{h0} ({tile_w}x{tile_h}) {tiff_params['photometric']}|{info_message}|{now.strftime('Date = %Y-%m-%d|Time = %H:%M:%S')}"
-        for k, v in kwargs.items():
-            descp += f'|{k} = {v}'
-        # resolution=(mpp * 1e-4, mpp * 1e-4, 'CENTIMETER')
-        tif.write(image, metadata=None, description=descp, subfiletype=0, **tiff_params,)  # subifds=len(scales), 
-
-        for scale in scales:
-            w, h = w0 // scale, h0 // scale
-            image = cv2.resize(image, dsize=(w, h), interpolation=cv2.INTER_LINEAR)
-            descp = f"{w0}x{h0} ({tile_w}x{tile_h}) -> {w}x{h} {tiff_params['photometric']}"
+        for page_idx, page in enumerate(image_list):
+            params = get_tiff_params(page, tiff_params)
+            w, h = image_sizes[page_idx]
+            if page_idx == 0:
+                subfiletype = 0
+                descp = description
+            else:
+                subfiletype = 1
+                descp = f"{w0}x{h0} ({tile_w}x{tile_h}) -> {w}x{h} {params['photometric']}"
+            print(f"{page.shape}", end=" ")
+            tif.write(page, metadata=None, description=to_ascii(descp), 
+                      subfiletype=subfiletype, **params,)
+            # mpp = slide_info.get('mpp', 0.25)
+            # resolution=(mpp * 1e-4, mpp * 1e-4, 'CENTIMETER')
+            # subifds=N_levels-1,
             # tile = (page.tilewidth, page.tilelength) if page.tilewidth > 0 and page.tilelength > 0 else None
             # resolution=(mpp * 1e-4 * w0/w, mpp * 1e-4 * h0/h, 'CENTIMETER')
-            tif.write(image, metadata=None, description=descp, subfiletype=1, **tiff_params,)
+        print("Success!")
 
 
 def main(args):
@@ -119,7 +161,7 @@ def main(args):
         with open(args.meta_info) as f:
             meta_info = json.load(f)
     else:
-        meta_info = {"mpp":0.25, "mag":"40x"}
+        meta_info = {"mpp": 0.25, "mag": "40x"}
 
     for file_idx, rel_path, slide_file in slide_files:
         output_dir = os.path.join(args.output_dir, os.path.dirname(rel_path))
@@ -139,22 +181,28 @@ def main(args):
             print(slide_id, slide_info)
             # try:
             if filter_image_file(slide_file, exts=['.tif', '.tiff', '.ndpi']):
-                image = get_page(slide_file, level=0)
+                images, description = get_level_images(slide_file, level=None)
+                # description from original file doesn't work with current writter (ome issue)
+                description = get_default_description(images[0], args.header, TIFF_PARAMS, **slide_info)
             else:
-                image = np.array(Image.open(slide_file), dtype=np.uint8)
-            print(f"Load in image with shape: {image.shape}")
+                images = rgba2rgb(np.array(Image.open(slide_file), dtype=np.uint8))
+                description = get_default_description(images, args.header, TIFF_PARAMS, **slide_info)
+            print(f"Load in images with shapes: {[_.shape for _ in images]}")
+            print(f"Image description: {description}")
 #             except Exception as e:
 #                 print(f"Failed to read file: {slide_file}.")
 #                 print(e)
 #                 continue
 
             try:
-                img_file = os.path.join(output_dir, f"{slide_id}.tiff")
-                wsi_imwrite(image, img_file, header=args.header, 
-                            slide_info=slide_info, bigtiff=args.bigtiff,
-                            tiff_params=TIFF_PARAMS,)
+                output_file = os.path.join(output_dir, f"{slide_id}.tiff")
+                wsi_imwrite(images, output_file, 
+                            description=description,
+                            scale=args.scale,
+                            tiff_params=TIFF_PARAMS,
+                            bigtiff=args.bigtiff,)
             except Exception as e:
-                print(f"Failed to write file: {img_file}.")
+                print(f"Failed to write file: {output_file}.")
                 print(e)
                 continue
 
@@ -166,6 +214,7 @@ if __name__ == '__main__':
     parser.add_argument('--header', default=f'Tiled Image', type=str, help="Header information.")
     parser.add_argument('--meta_info', default=None, type=str, help="Meta data write to image (mag, mpp, etc).")
     parser.add_argument('--output_dir', default=None, type=str, help="Output folder.")
+    parser.add_argument('--scale', default=0.5, type=float, help="Downsampling scale for pyramid tiff, default=0.5.")
     parser.add_argument('--bigtiff', action='store_true', help="BigTiff format.")
 
     args = parser.parse_args()
